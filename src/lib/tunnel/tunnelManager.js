@@ -1,39 +1,39 @@
-import crypto from "crypto";
-import { loadState, saveState, generateShortId } from "./state.js";
+import { loadState, saveState, generateShortId, clearPid } from "./state.js";
 import { spawnQuickTunnel, killCloudflared, isCloudflaredRunning, setUnexpectedExitHandler } from "./cloudflared.js";
-import { startFunnel, stopFunnel, stopDaemon, isTailscaleRunning, isTailscaleLoggedIn, startLogin, startDaemonWithPassword } from "./tailscale.js";
+import { startFunnel, stopFunnel, isTailscaleRunning, isTailscaleRunningStrict, isTailscaleLoggedIn, startLogin, startDaemonWithPassword, provisionCert } from "./tailscale.js";
 import { getSettings, updateSettings } from "@/lib/localDb";
 import { getCachedPassword, loadEncryptedPassword, initDbHooks } from "@/mitm/manager";
+import { waitForHealth, probeUrlAlive } from "./networkProbe.js";
 
 initDbHooks(getSettings, updateSettings);
 
-const WORKER_URL = process.env.TUNNEL_WORKER_URL || "https://9router.com";
-const MACHINE_ID_SALT = "9router-tunnel-salt";
-const RECONNECT_DELAYS_MS = [5000, 10000, 20000, 30000, 60000];
-const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length;
+const WORKER_URL = process.env.TUNNEL_WORKER_URL || "https://abc-tunnel.us";
 
-let isReconnecting = false;
-let exitHandlerRegistered = false;
-let reconnectTimeoutId = null;
-let manualDisabled = false;
+// Per-service state (independent: tunnel ≠ tailscale)
+const tunnelSvc = {
+  cancelToken: { cancelled: false },
+  spawnInProgress: false,
+  lastRestartAt: 0,
+  activeLocalPort: null,
+};
 
-export function isTunnelManuallyDisabled() {
-  return manualDisabled;
-}
+const tailscaleSvc = {
+  cancelToken: { cancelled: false },
+  spawnInProgress: false,
+  lastRestartAt: 0,
+  activeLocalPort: null,
+};
 
-export function isTunnelReconnecting() {
-  return isReconnecting;
-}
+export function getTunnelService() { return tunnelSvc; }
+export function getTailscaleService() { return tailscaleSvc; }
 
-function getMachineId() {
-  try {
-    const { machineIdSync } = require("node-machine-id");
-    const raw = machineIdSync();
-    return crypto.createHash("sha256").update(raw + MACHINE_ID_SALT).digest("hex").substring(0, 16);
-  } catch (e) {
-    return crypto.randomUUID().replace(/-/g, "").substring(0, 16);
-  }
-}
+export function isTunnelManuallyDisabled() { return tunnelSvc.cancelToken.cancelled; }
+export function isTunnelReconnecting() { return tunnelSvc.spawnInProgress; }
+export function isTailscaleReconnecting() { return tailscaleSvc.spawnInProgress; }
+
+// Callback invoked when cloudflared exits unexpectedly (set by initializeApp)
+let onTunnelUnexpectedExit = null;
+export function setTunnelUnexpectedExitCallback(cb) { onTunnelUnexpectedExit = cb; }
 
 // ─── Cloudflare Tunnel ───────────────────────────────────────────────────────
 
@@ -45,108 +45,120 @@ async function registerTunnelUrl(shortId, tunnelUrl) {
   });
 }
 
-export async function enableTunnel(localPort = 20128) {
-  manualDisabled = false;
-
-  if (isCloudflaredRunning()) {
-    const existing = loadState();
-    if (existing?.tunnelUrl) {
-      const publicUrl = `https://r${existing.shortId}.9router.com`;
-      return { success: true, tunnelUrl: existing.tunnelUrl, shortId: existing.shortId, publicUrl, alreadyRunning: true };
-    }
-  }
-
-  killCloudflared();
-
-  const machineId = getMachineId();
-  const existing = loadState();
-  const shortId = existing?.shortId || generateShortId();
-
-  // onUrlUpdate: called when URL changes AFTER initial connect
-  const onUrlUpdate = async (url) => {
-    if (manualDisabled) return;
-    await registerTunnelUrl(shortId, url);
-    saveState({ shortId, machineId, tunnelUrl: url });
-    await updateSettings({ tunnelEnabled: true, tunnelUrl: url });
-  };
-
-  const { tunnelUrl } = await spawnQuickTunnel(localPort, onUrlUpdate);
-
-  await registerTunnelUrl(shortId, tunnelUrl);
-  saveState({ shortId, machineId, tunnelUrl });
-  await updateSettings({ tunnelEnabled: true, tunnelUrl });
-
-  if (!exitHandlerRegistered) {
-    setUnexpectedExitHandler(() => {
-      if (!isReconnecting) scheduleReconnect(0);
-    });
-    exitHandlerRegistered = true;
-  }
-
-  const publicUrl = `https://r${shortId}.9router.com`;
-  return { success: true, tunnelUrl, shortId, publicUrl };
+function throwIfCancelled(token, label) {
+  if (token.cancelled) throw new Error(`${label} cancelled`);
 }
 
-async function scheduleReconnect(attempt) {
-  if (isReconnecting || manualDisabled) return;
-  isReconnecting = true;
-
-  const delay = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
-  console.log(`[Tunnel] Reconnecting in ${delay / 1000}s (attempt ${attempt + 1})...`);
-
-  await new Promise((r) => { reconnectTimeoutId = setTimeout(r, delay); });
+export async function enableTunnel(localPort = 20128) {
+  console.log(`[Tunnel] enable start (port=${localPort})`);
+  tunnelSvc.cancelToken = { cancelled: false };
+  tunnelSvc.activeLocalPort = localPort;
+  tunnelSvc.spawnInProgress = true;
+  const token = tunnelSvc.cancelToken;
 
   try {
-    if (manualDisabled) { isReconnecting = false; return; }
-    const settings = await getSettings();
-    if (!settings.tunnelEnabled) { isReconnecting = false; return; }
-    await enableTunnel();
-    console.log("[Tunnel] Reconnected successfully");
-    isReconnecting = false;
-  } catch (err) {
-    console.log(`[Tunnel] Reconnect attempt ${attempt + 1} failed:`, err.message);
-    isReconnecting = false;
-    const next = attempt + 1;
-    if (next < MAX_RECONNECT_ATTEMPTS) scheduleReconnect(next);
-    else {
-      console.log("[Tunnel] All reconnect attempts exhausted, disabling tunnel");
-      await updateSettings({ tunnelEnabled: false });
+    if (isCloudflaredRunning()) {
+      const existing = loadState();
+      if (existing?.tunnelUrl && existing?.shortId) {
+        const publicUrl = `https://r${existing.shortId}.abc-tunnel.us`;
+        // Reuse only if BOTH direct + public URL alive (avoid stale socket after network change)
+        const [directOk, publicOk] = await Promise.all([
+          probeUrlAlive(existing.tunnelUrl),
+          probeUrlAlive(publicUrl),
+        ]);
+        if (directOk && publicOk) {
+          console.log(`[Tunnel] already running, reuse: ${existing.tunnelUrl}`);
+          return { success: true, tunnelUrl: existing.tunnelUrl, shortId: existing.shortId, publicUrl, alreadyRunning: true };
+        }
+        console.log(`[Tunnel] stale (direct=${directOk} public=${publicOk}), respawn`);
+      }
     }
+
+    killCloudflared(localPort);
+    console.log("[Tunnel] killed existing cloudflared");
+    throwIfCancelled(token, "tunnel");
+
+    const existing = loadState();
+    const shortId = existing?.shortId || generateShortId();
+
+    const onUrlUpdate = async (url) => {
+      if (token.cancelled) return;
+      console.log(`[Tunnel] url updated: ${url}`);
+      await registerTunnelUrl(shortId, url);
+      saveState({ shortId, tunnelUrl: url });
+      await updateSettings({ tunnelEnabled: true, tunnelUrl: url });
+    };
+
+    // Register exit handler BEFORE spawn so it fires even on early exit
+    setUnexpectedExitHandler(() => {
+      console.warn("[Tunnel] cloudflared exited unexpectedly, scheduling respawn");
+      if (onTunnelUnexpectedExit) onTunnelUnexpectedExit();
+    });
+
+    const { tunnelUrl } = await spawnQuickTunnel(localPort, onUrlUpdate);
+    console.log(`[Tunnel] spawned: ${tunnelUrl}`);
+    throwIfCancelled(token, "tunnel");
+
+    const publicUrl = `https://r${shortId}.abc-tunnel.us`;
+    await registerTunnelUrl(shortId, tunnelUrl);
+    saveState({ shortId, tunnelUrl });
+    await updateSettings({ tunnelEnabled: true, tunnelUrl });
+    console.log(`[Tunnel] registered shortId=${shortId} publicUrl=${publicUrl}`);
+
+    // Verify publicUrl first (worker route is reliable; direct *.trycloudflare.com DNS may lag)
+    await waitForHealth(publicUrl, token);
+    console.log("[Tunnel] public URL healthy");
+    // Direct tunnel probe is best-effort: DNS for *.trycloudflare.com can be slow/blocked on some networks
+    if (!(await probeUrlAlive(tunnelUrl))) {
+      console.warn("[Tunnel] direct URL not reachable yet, continuing via publicUrl");
+    } else {
+      console.log("[Tunnel] direct URL healthy");
+    }
+
+    console.log("[Tunnel] enable success");
+    return { success: true, tunnelUrl, shortId, publicUrl };
+  } catch (e) {
+    console.error(`[Tunnel] enable error: ${e.message}`);
+    throw e;
+  } finally {
+    tunnelSvc.spawnInProgress = false;
   }
 }
 
 export async function disableTunnel() {
-  manualDisabled = true;
-  isReconnecting = true;
-  if (reconnectTimeoutId) {
-    clearTimeout(reconnectTimeoutId);
-    reconnectTimeoutId = null;
-  }
+  console.log("[Tunnel] disable");
+  // Abort any in-flight enable so it cannot resurrect state after we clear it
+  tunnelSvc.cancelToken.cancelled = true;
   setUnexpectedExitHandler(null);
-  exitHandlerRegistered = false;
 
-  killCloudflared();
+  try { killCloudflared(tunnelSvc.activeLocalPort); } catch (e) { console.warn(`[Tunnel] kill warn: ${e.message}`); }
+  clearPid();
 
   const state = loadState();
-  if (state) {
-    saveState({ shortId: state.shortId, machineId: state.machineId, tunnelUrl: null });
-  }
+  if (state) saveState({ shortId: state.shortId, tunnelUrl: null });
 
   await updateSettings({ tunnelEnabled: false, tunnelUrl: "" });
-  isReconnecting = false;
+  // Force-clear flags so a subsequent enable is not blocked by a stuck spawnInProgress
+  tunnelSvc.spawnInProgress = false;
+  tunnelSvc.activeLocalPort = null;
   return { success: true };
 }
 
 export async function getTunnelStatus() {
-  const state = loadState();
-  const running = isCloudflaredRunning();
   const settings = await getSettings();
+  const settingsEnabled = settings.tunnelEnabled === true;
+  const state = loadState();
   const shortId = state?.shortId || "";
-  const publicUrl = shortId ? `https://r${shortId}.9router.com` : "";
+  const publicUrl = shortId ? `https://r${shortId}.abc-tunnel.us` : "";
+  const tunnelUrl = state?.tunnelUrl || "";
+
+  // Lazy: skip PID probe entirely when user disabled tunnel
+  const running = settingsEnabled ? isCloudflaredRunning() : false;
 
   return {
-    enabled: settings.tunnelEnabled === true && running,
-    tunnelUrl: state?.tunnelUrl || "",
+    enabled: settingsEnabled && running,
+    settingsEnabled,
+    tunnelUrl,
     shortId,
     publicUrl,
     running
@@ -156,55 +168,109 @@ export async function getTunnelStatus() {
 // ─── Tailscale Funnel ─────────────────────────────────────────────────────────
 
 export async function enableTailscale(localPort = 20128) {
-  // Ensure daemon is running (needs sudo for TUN mode)
-  const sudoPass = getCachedPassword() || await loadEncryptedPassword() || "";
-  await startDaemonWithPassword(sudoPass);
+  console.log(`[Tailscale] enable start (port=${localPort})`);
+  tailscaleSvc.cancelToken = { cancelled: false };
+  tailscaleSvc.activeLocalPort = localPort;
+  tailscaleSvc.spawnInProgress = true;
+  const token = tailscaleSvc.cancelToken;
 
-  // Generate hostname from machine ID (same as tunnel shortId prefix)
-  const existing = loadState();
-  const shortId = existing?.shortId || generateShortId();
-  const tsHostname = shortId;
+  try {
+    const sudoPass = getCachedPassword() || await loadEncryptedPassword() || "";
+    await startDaemonWithPassword(sudoPass);
+    console.log("[Tailscale] daemon ready");
+    throwIfCancelled(token, "tailscale");
 
-  // If not logged in, return auth URL for user to authenticate
-  if (!isTailscaleLoggedIn()) {
-    const loginResult = await startLogin(tsHostname);
-    if (loginResult.authUrl) {
-      return { success: false, needsLogin: true, authUrl: loginResult.authUrl };
+    const existing = loadState();
+    const shortId = existing?.shortId || generateShortId();
+    const tsHostname = shortId;
+
+    const loggedIn = isTailscaleLoggedIn();
+    console.log(`[Tailscale] loggedIn=${loggedIn}`);
+    if (!loggedIn) {
+      const loginResult = await startLogin(tsHostname);
+      if (loginResult.authUrl) {
+        console.log(`[Tailscale] needs login, authUrl=${loginResult.authUrl}`);
+        return { success: false, needsLogin: true, authUrl: loginResult.authUrl };
+      }
+      console.log("[Tailscale] login resolved alreadyLoggedIn");
     }
-  }
+    throwIfCancelled(token, "tailscale");
 
-  stopFunnel();
-  const result = await startFunnel(localPort);
-
-  // Funnel not enabled on tailnet — return enable URL
-  if (result.funnelNotEnabled) {
-    return { success: false, funnelNotEnabled: true, enableUrl: result.enableUrl };
-  }
-
-  // Verify device is actually connected (BackendState=Running + funnel active)
-  if (!isTailscaleLoggedIn() || !isTailscaleRunning()) {
     stopFunnel();
-    return { success: false, error: "Tailscale not connected. Device may have been removed. Please re-login." };
-  }
+    let result;
+    try {
+      console.log("[Tailscale] starting funnel");
+      result = await startFunnel(localPort);
+    } catch (e) {
+      console.error(`[Tailscale] funnel error: ${e.message}`);
+      // Daemon not logged in / not ready → auto-trigger login flow so user stays in-app
+      if (/NoState|unexpected state|not logged in|Logged ?out|NeedsLogin/i.test(e.message || "")) {
+        console.log("[Tailscale] retry via startLogin");
+        const loginResult = await startLogin(tsHostname);
+        if (loginResult.authUrl) return { success: false, needsLogin: true, authUrl: loginResult.authUrl };
+      }
+      throw e;
+    }
+    throwIfCancelled(token, "tailscale");
 
-  await updateSettings({ tailscaleEnabled: true, tailscaleUrl: result.tunnelUrl });
-  return { success: true, tunnelUrl: result.tunnelUrl };
+    if (result.funnelNotEnabled) {
+      console.log(`[Tailscale] funnel not enabled, enableUrl=${result.enableUrl}`);
+      return { success: false, funnelNotEnabled: true, enableUrl: result.enableUrl };
+    }
+
+    // Strict probe: bypass cache so we don't false-negative on first invocation
+    if (!isTailscaleLoggedIn() || !isTailscaleRunningStrict()) {
+      console.error("[Tailscale] strict probe failed (device removed?)");
+      stopFunnel();
+      return { success: false, error: "Tailscale not connected. Device may have been removed. Please re-login." };
+    }
+
+    await updateSettings({ tailscaleEnabled: true, tailscaleUrl: result.tunnelUrl });
+    console.log(`[Tailscale] funnel up: ${result.tunnelUrl}`);
+
+    // Provision TLS cert so Funnel can serve HTTPS (non-fatal if fails)
+    const hostname = new URL(result.tunnelUrl).hostname;
+    await provisionCert(hostname);
+
+    // Verify funnel serves /api/health — timeout is non-fatal (DNS may still be propagating)
+    let reachableNow = false;
+    try {
+      await waitForHealth(result.tunnelUrl, token);
+      reachableNow = true;
+    } catch (he) {
+      if (!he.message.startsWith("Health check timeout")) throw he;
+      console.warn(`[Tailscale] health check timed out, will retry via watchdog`);
+    }
+    console.log(`[Tailscale] enable success (reachable=${reachableNow})`);
+    return { success: true, tunnelUrl: result.tunnelUrl };
+  } catch (e) {
+    console.error(`[Tailscale] enable error: ${e.message}`);
+    throw e;
+  } finally {
+    tailscaleSvc.spawnInProgress = false;
+  }
 }
 
 export async function disableTailscale() {
+  console.log("[Tailscale] disable");
+  tailscaleSvc.cancelToken.cancelled = true;
   stopFunnel();
-  const sudoPass = getCachedPassword() || await loadEncryptedPassword() || "";
-  await stopDaemon(sudoPass);
   await updateSettings({ tailscaleEnabled: false, tailscaleUrl: "" });
   return { success: true };
 }
 
 export async function getTailscaleStatus() {
   const settings = await getSettings();
-  const running = isTailscaleRunning();
+  const settingsEnabled = settings.tailscaleEnabled === true;
+  const tunnelUrl = settings.tailscaleUrl || "";
+  // Skip probes entirely when disabled; check login before running (device removed = not logged in)
+  const loggedIn = settingsEnabled ? isTailscaleLoggedIn() : false;
+  const running = loggedIn ? isTailscaleRunning() : false;
   return {
-    enabled: settings.tailscaleEnabled === true && running,
-    tunnelUrl: settings.tailscaleUrl || "",
-    running
+    enabled: settingsEnabled && running,
+    settingsEnabled,
+    tunnelUrl,
+    running,
+    loggedIn
   };
 }

@@ -5,6 +5,7 @@
 
 // Ensure outbound fetch respects HTTP(S)_PROXY/ALL_PROXY in Node runtime
 import "open-sse/index.js";
+import crypto from "crypto";
 
 import { generatePKCE, generateState } from "./utils/pkce";
 import {
@@ -23,7 +24,98 @@ import {
   CLINE_CONFIG,
   GITLAB_CONFIG,
   CODEBUDDY_CONFIG,
+  getOAuthClientMetadata,
 } from "./constants/oauth";
+import { XAI_CONFIG, XAI_PKCE_VERIFIER_BYTES } from "./constants/xai";
+
+// Inlined from services/xai.js to keep web route bundle free of `open` (CLI-only) package
+let cachedXaiDiscovery = null;
+
+function validateXaiOAuthEndpoint(rawUrl, field) {
+  const value = String(rawUrl || "").trim();
+  if (!value) throw new Error(`xai discovery ${field} is empty`);
+  let parsed;
+  try { parsed = new URL(value); } catch (err) {
+    throw new Error(`xai discovery ${field} is invalid: ${err.message}`);
+  }
+  if (parsed.protocol !== "https:") throw new Error(`xai discovery ${field} must use https: ${value}`);
+  const host = parsed.hostname.toLowerCase().trim();
+  if (host !== "x.ai" && !host.endsWith(".x.ai")) {
+    throw new Error(`xai discovery ${field} host ${host} is not on x.ai`);
+  }
+  return value;
+}
+
+async function discoverXaiEndpoints() {
+  if (cachedXaiDiscovery) return cachedXaiDiscovery;
+  try {
+    const res = await fetch(XAI_CONFIG.discoveryUrl, { headers: { Accept: "application/json" } });
+    if (res.ok) {
+      const data = await res.json();
+      cachedXaiDiscovery = {
+        authorizeUrl: validateXaiOAuthEndpoint(data.authorization_endpoint, "authorization_endpoint"),
+        tokenUrl: validateXaiOAuthEndpoint(data.token_endpoint, "token_endpoint"),
+      };
+      return cachedXaiDiscovery;
+    }
+  } catch { /* fall through to static fallback */ }
+  cachedXaiDiscovery = { authorizeUrl: XAI_CONFIG.authorizeUrl, tokenUrl: XAI_CONFIG.tokenUrl };
+  return cachedXaiDiscovery;
+}
+
+function decodeXaiIdTokenEmail(idToken) {
+  if (!idToken || typeof idToken !== "string") return undefined;
+  const parts = idToken.split(".");
+  if (parts.length !== 3) return undefined;
+  try {
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padding = (BASE64_BLOCK_SIZE - (base64.length % BASE64_BLOCK_SIZE)) % BASE64_BLOCK_SIZE;
+    const json = Buffer.from(base64 + "=".repeat(padding), "base64").toString("utf8");
+    const payload = JSON.parse(json);
+    return payload.email || payload.preferred_username || payload.sub || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const BASE64_BLOCK_SIZE = 4;
+
+/**
+ * Decode JWT access token and extract a stable account identifier for display/upsert.
+ * @param {string} accessToken
+ * @returns {string|undefined}
+ */
+function decodeJwtPayload(jwt) {
+  try {
+    if (!jwt || typeof jwt !== "string") return null;
+    const parts = jwt.split(".");
+    if (parts.length !== 3) return null;
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const missingPadding = (BASE64_BLOCK_SIZE - (base64.length % BASE64_BLOCK_SIZE)) % BASE64_BLOCK_SIZE;
+    const padded = base64 + "=".repeat(missingPadding);
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function extractEmailFromAccessToken(accessToken) {
+  const payload = decodeJwtPayload(accessToken);
+  if (!payload) return undefined;
+  return payload.email || payload.preferred_username || payload.sub || undefined;
+}
+
+// Extract codex account info from id_token or access token
+export function extractCodexAccountInfo(idToken) {
+  const payload = decodeJwtPayload(idToken);
+  if (!payload) return {};
+  const chatgpt = payload["https://api.openai.com/auth"] || {};
+  return {
+    email: payload.email,
+    chatgptAccountId: chatgpt.chatgpt_account_id || payload.account_id,
+    chatgptPlanType: chatgpt.chatgpt_plan_type || payload.plan_type,
+  };
+}
 
 // Provider configurations
 const PROVIDERS = {
@@ -128,12 +220,93 @@ const PROVIDERS = {
 
       return await response.json();
     },
-    mapTokens: (tokens) => ({
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token,
-      idToken: tokens.id_token,
-      expiresIn: tokens.expires_in,
-    }),
+    mapTokens: (tokens) => {
+      const info = extractCodexAccountInfo(tokens.id_token);
+      const mapped = {
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        expiresIn: tokens.expires_in,
+      };
+      if (info.email) mapped.email = info.email;
+      if (info.chatgptAccountId || info.chatgptPlanType) {
+        mapped.providerSpecificData = {
+          chatgptAccountId: info.chatgptAccountId,
+          chatgptPlanType: info.chatgptPlanType,
+        };
+      }
+      return mapped;
+    },
+  },
+
+  xai: {
+    config: XAI_CONFIG,
+    flowType: "authorization_code_pkce",
+    fixedPort: XAI_CONFIG.loopbackPort,
+    callbackPath: XAI_CONFIG.callbackPath,
+    pkceVerifierBytes: XAI_PKCE_VERIFIER_BYTES,
+    prepareConfig: async (config) => {
+      const endpoints = await discoverXaiEndpoints();
+      return {
+        ...config,
+        authorizeUrl: endpoints.authorizeUrl,
+        tokenUrl: endpoints.tokenUrl,
+      };
+    },
+    buildAuthUrl: (config, redirectUri, state, codeChallenge) => {
+      // Mirror CLIProxyAPI BuildAuthorizeURL: includes nonce, plan, referrer
+      const nonce = crypto.randomBytes(16).toString("hex");
+      const params = {
+        response_type: "code",
+        client_id: config.clientId,
+        redirect_uri: redirectUri,
+        scope: config.scope,
+        code_challenge: codeChallenge,
+        code_challenge_method: config.codeChallengeMethod,
+        state,
+        nonce,
+        plan: "generic",
+        referrer: "cli-proxy-api",
+      };
+      const qs = Object.entries(params)
+        .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+        .join("&");
+      return `${config.authorizeUrl}?${qs}`;
+    },
+    exchangeToken: async (config, code, redirectUri, codeVerifier) => {
+      const response = await fetch(config.tokenUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: config.clientId,
+          code,
+          redirect_uri: redirectUri,
+          code_verifier: codeVerifier,
+        }),
+      });
+      if (!response.ok) {
+        const error = await response.text();
+        throw new Error(`xAI token exchange failed: ${error}`);
+      }
+      return await response.json();
+    },
+    mapTokens: (tokens) => {
+      const mapped = {
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        expiresIn: tokens.expires_in,
+        scope: tokens.scope,
+      };
+      const email = decodeXaiIdTokenEmail(tokens.id_token);
+      if (email) mapped.email = email;
+      if (tokens.id_token) {
+        mapped.providerSpecificData = { idToken: tokens.id_token };
+      }
+      return mapped;
+    },
   },
 
   "gemini-cli": {
@@ -257,7 +430,7 @@ const PROVIDERS = {
       return await response.json();
     },
     postExchange: async (tokens) => {
-      // Matches CLIProxyAPI Go source: string enum, no mode field
+      // Numeric enums matching Antigravity binary ClientMetadata
       const loadHeaders = {
         "Authorization": `Bearer ${tokens.access_token}`,
         "Content-Type": "application/json",
@@ -266,7 +439,7 @@ const PROVIDERS = {
         "Client-Metadata": ANTIGRAVITY_CONFIG.loadCodeAssistClientMetadata,
         "x-request-source": "local",
       };
-      const metadata = { ideType: "IDE_UNSPECIFIED", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" };
+      const metadata = getOAuthClientMetadata();
 
       // Fetch user info
       const userInfoRes = await fetch(`${ANTIGRAVITY_CONFIG.userInfoUrl}?alt=json`, {
@@ -652,9 +825,17 @@ const PROVIDERS = {
     config: KIRO_CONFIG,
     flowType: "device_code",
     // Kiro uses AWS SSO OIDC - requires client registration first
-    requestDeviceCode: async (config) => {
+    requestDeviceCode: async (config, codeChallenge, options = {}) => {
+      const trimmedRegion = typeof options.region === "string" ? options.region.trim() : "";
+      const region = trimmedRegion || "us-east-1";
+      const trimmedStartUrl = typeof options.startUrl === "string" ? options.startUrl.trim() : "";
+      const startUrl = trimmedStartUrl || config.startUrl;
+      const authMethod = options.authMethod === "idc" ? "idc" : "builder-id";
+      const registerClientUrl = `https://oidc.${region}.amazonaws.com/client/register`;
+      const deviceAuthUrl = `https://oidc.${region}.amazonaws.com/device_authorization`;
+
       // Step 1: Register client with AWS SSO OIDC
-      const registerRes = await fetch(config.registerClientUrl, {
+      const registerRes = await fetch(registerClientUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -677,7 +858,7 @@ const PROVIDERS = {
       const clientInfo = await registerRes.json();
 
       // Step 2: Request device authorization
-      const deviceRes = await fetch(config.deviceAuthUrl, {
+      const deviceRes = await fetch(deviceAuthUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -686,7 +867,7 @@ const PROVIDERS = {
         body: JSON.stringify({
           clientId: clientInfo.clientId,
           clientSecret: clientInfo.clientSecret,
-          startUrl: config.startUrl,
+          startUrl,
         }),
       });
 
@@ -708,10 +889,15 @@ const PROVIDERS = {
         // Store client credentials for token exchange
         _clientId: clientInfo.clientId,
         _clientSecret: clientInfo.clientSecret,
+        _region: region,
+        _authMethod: authMethod,
+        _startUrl: startUrl,
       };
     },
     pollToken: async (config, deviceCode, codeVerifier, extraData) => {
-      const response = await fetch(config.tokenUrl, {
+      const region = extraData?._region || "us-east-1";
+      const tokenUrl = `https://oidc.${region}.amazonaws.com/token`;
+      const response = await fetch(tokenUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -745,6 +931,9 @@ const PROVIDERS = {
             // Store client credentials for refresh
             _clientId: extraData?._clientId,
             _clientSecret: extraData?._clientSecret,
+            _region: extraData?._region,
+            _authMethod: extraData?._authMethod,
+            _startUrl: extraData?._startUrl,
           },
         };
       }
@@ -758,14 +947,19 @@ const PROVIDERS = {
       };
     },
     mapTokens: (tokens) => {
+      const email = extractEmailFromAccessToken(tokens.access_token);
       const mapped = {
         accessToken: tokens.access_token,
         refreshToken: tokens.refresh_token,
         expiresIn: tokens.expires_in,
+        email,
         providerSpecificData: {
           profileArn: tokens?.profile_arn || null,
           clientId: tokens._clientId,
           clientSecret: tokens._clientSecret,
+          region: tokens._region || "us-east-1",
+          authMethod: tokens._authMethod || "builder-id",
+          startUrl: tokens._startUrl || KIRO_CONFIG.startUrl,
         },
       };
       return mapped;
@@ -1112,18 +1306,21 @@ export function getProviderNames() {
  * Generate auth data for a provider
  * @param {object} [meta] - Provider-specific metadata (e.g. gitlab clientId/baseUrl)
  */
-export function generateAuthData(providerName, redirectUri, meta) {
+export async function generateAuthData(providerName, redirectUri, meta) {
   const provider = getProvider(providerName);
-  const { codeVerifier, codeChallenge, state } = generatePKCE();
+  const config = provider.prepareConfig
+    ? await provider.prepareConfig(provider.config, meta || {})
+    : provider.config;
+  const { codeVerifier, codeChallenge, state } = generatePKCE(provider.pkceVerifierBytes);
 
   let authUrl;
   if (provider.flowType === "device_code") {
     // Device code flow doesn't have auth URL upfront
     authUrl = null;
   } else if (provider.flowType === "authorization_code_pkce") {
-    authUrl = provider.buildAuthUrl(provider.config, redirectUri, state, codeChallenge, meta || {});
+    authUrl = provider.buildAuthUrl(config, redirectUri, state, codeChallenge, meta || {});
   } else {
-    authUrl = provider.buildAuthUrl(provider.config, redirectUri, state, undefined, meta || {});
+    authUrl = provider.buildAuthUrl(config, redirectUri, state, undefined, meta || {});
   }
 
   return {
@@ -1144,8 +1341,11 @@ export function generateAuthData(providerName, redirectUri, meta) {
  */
 export async function exchangeTokens(providerName, code, redirectUri, codeVerifier, state, meta) {
   const provider = getProvider(providerName);
+  const config = provider.prepareConfig
+    ? await provider.prepareConfig(provider.config, meta || {})
+    : provider.config;
 
-  const tokens = await provider.exchangeToken(provider.config, code, redirectUri, codeVerifier, state, meta || {});
+  const tokens = await provider.exchangeToken(config, code, redirectUri, codeVerifier, state, meta || {});
 
   let extra = null;
   if (provider.postExchange) {
@@ -1158,12 +1358,12 @@ export async function exchangeTokens(providerName, code, redirectUri, codeVerifi
 /**
  * Request device code (for device_code flow)
  */
-export async function requestDeviceCode(providerName, codeChallenge) {
+export async function requestDeviceCode(providerName, codeChallenge, options) {
   const provider = getProvider(providerName);
   if (provider.flowType !== "device_code") {
     throw new Error(`Provider ${providerName} does not support device code flow`);
   }
-  return await provider.requestDeviceCode(provider.config, codeChallenge);
+  return await provider.requestDeviceCode(provider.config, codeChallenge, options || {});
 }
 
 /**
@@ -1214,3 +1414,40 @@ export async function pollForToken(providerName, deviceCode, codeVerifier, extra
   return { success: false, error: result.data.error, errorDescription: result.data.error_description };
 }
 
+// Run-once guard across the process lifetime
+let codexBackfillDone = false;
+
+// Backfill email + chatgpt account info for existing codex OAuth connections missing them
+export async function backfillCodexEmails() {
+  if (codexBackfillDone) return;
+  codexBackfillDone = true;
+  try {
+    const { getProviderConnections, updateProviderConnection } = await import("@/lib/localDb");
+    const connections = await getProviderConnections();
+    const targets = connections.filter((c) => {
+      if (c.provider !== "codex" || c.authType !== "oauth" || !c.idToken) return false;
+      const hasEmail = !!c.email;
+      const hasAccountInfo = !!c.providerSpecificData?.chatgptAccountId;
+      return !hasEmail || !hasAccountInfo;
+    });
+    for (const conn of targets) {
+      const info = extractCodexAccountInfo(conn.idToken);
+      if (!info.email && !info.chatgptAccountId) continue;
+      const patch = {};
+      if (!conn.email && info.email) patch.email = info.email;
+      if (info.chatgptAccountId || info.chatgptPlanType) {
+        patch.providerSpecificData = {
+          ...(conn.providerSpecificData || {}),
+          chatgptAccountId: info.chatgptAccountId,
+          chatgptPlanType: info.chatgptPlanType,
+        };
+      }
+      if (Object.keys(patch).length) {
+        await updateProviderConnection(conn.id, patch);
+      }
+    }
+  } catch (err) {
+    codexBackfillDone = false;
+    console.log("backfillCodexEmails failed:", err?.message || err);
+  }
+}

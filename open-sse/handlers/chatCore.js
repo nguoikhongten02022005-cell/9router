@@ -16,6 +16,9 @@ import { handleForcedSSEToJson } from "./chatCore/sseToJsonHandler.js";
 import { handleNonStreamingResponse } from "./chatCore/nonStreamingHandler.js";
 import { handleStreamingResponse, buildOnStreamComplete } from "./chatCore/streamingHandler.js";
 import { detectClientTool, isNativePassthrough } from "../utils/clientDetector.js";
+import { dedupeTools } from "../utils/toolDeduper.js";
+import { injectCaveman } from "../rtk/caveman.js";
+import { compressMessages, formatRtkLog } from "../rtk/index.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -24,7 +27,7 @@ import { detectClientTool, isNativePassthrough } from "../utils/clientDetector.j
  * @param {object} options.credentials - Provider credentials
  * @param {string} options.sourceFormatOverride - Override detected source format (e.g. "openai-responses")
  */
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, sourceFormatOverride }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, cavemanEnabled, cavemanLevel, sourceFormatOverride, providerThinking }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
 
@@ -39,9 +42,29 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const targetFormat = modelTargetFormat || getTargetFormat(provider);
   const stripList = getModelStrip(alias, model);
 
+  // Inject provider-level thinking config override (only if client hasn't set)
+  // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
+  if (providerThinking?.mode && providerThinking.mode !== "auto") {
+    const mode = providerThinking.mode;
+    if (mode === "on" && !body.thinking) {
+      console.log("Injecting provider-level thinking config override: on");
+      body = { ...body, thinking: { type: "enabled", budget_tokens: 10000 } };
+    } else if (mode === "off" && !body.thinking) {
+      body = { ...body, thinking: { type: "disabled" } };
+    } else if (!body.reasoning_effort) {
+      body = { ...body, reasoning_effort: mode };
+    }
+  }
+
   const clientRequestedStreaming = body.stream === true || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI;
-  const providerRequiresStreaming = provider === "openai" || provider === "codex";
+  const providerRequiresStreaming = provider === "openai" || provider === "codex" || provider === "commandcode";
   let stream = providerRequiresStreaming ? true : (body.stream !== false);
+
+  // DeepSeek-TUI: interactive TUI panel sends stream:true and needs SSE.
+  // Non-interactive mode (-p flag) sends without stream and can't parse SSE.
+  // Only force non-streaming when client didn't explicitly request it.
+  const detectedTool = detectClientTool(clientRawRequest?.headers || {}, body);
+  if (detectedTool === "deepseek-tui" && body.stream !== true) stream = false;
 
   // Check client Accept header preference for non-streaming requests
   // This fixes AI SDK compatibility where clients send Accept: application/json
@@ -68,7 +91,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     log?.debug?.("PASSTHROUGH", `${clientTool} → ${provider} | native lossless`);
     translatedBody = { ...body, model };
   } else {
-    translatedBody = translateRequest(sourceFormat, targetFormat, model, body, stream, credentials, provider, reqLogger, stripList, connectionId);
+    translatedBody = translateRequest(sourceFormat, targetFormat, model, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool);
     if (!translatedBody) {
       trackPendingRequest(model, provider, connectionId, false, true);
       return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Failed to translate request for ${sourceFormat} → ${targetFormat}`);
@@ -78,9 +101,33 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     translatedBody.model = model;
   }
 
+  // Dedupe duplicate built-in tools when equivalent MCP tools are present (Claude clients only).
+  if (clientTool === "claude" && Array.isArray(translatedBody.tools)) {
+    const { tools: deduped, stripped } = dedupeTools(translatedBody.tools);
+    if (stripped.length > 0) {
+      translatedBody.tools = deduped;
+      log?.debug?.("TOOLDEDUP", `stripped ${stripped.length}: ${stripped.slice(0, 3).join(", ")}${stripped.length > 3 ? "..." : ""}`);
+    }
+  }
+
+  // Token savers: applied at the final body just before dispatch
+  // Covers both passthrough (source shape) and translated (target shape) flows
+  const finalFormat = passthrough ? sourceFormat : targetFormat;
+
+  // RTK: compress tool_result content
+  const rtkStats = compressMessages(translatedBody, rtkEnabled);
+  const rtkLine = formatRtkLog(rtkStats);
+  if (rtkLine) console.log(rtkLine);
+
+  // Caveman: inject terse-style system prompt
+  if (cavemanEnabled && cavemanLevel) {
+    injectCaveman(translatedBody, finalFormat, cavemanLevel);
+    log?.debug?.("CAVEMAN", `${cavemanLevel} | ${finalFormat}`);
+  }
+
   const executor = getExecutor(provider);
   trackPendingRequest(model, provider, connectionId, true);
-  appendRequestLog({ model, provider, connectionId, status: "PENDING" }).catch(() => {});
+  appendRequestLog({ model, provider, connectionId, status: "PENDING" }).catch(() => { });
 
   const msgCount = translatedBody.messages?.length || translatedBody.input?.length || translatedBody.contents?.length || translatedBody.request?.contents?.length || 0;
   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
@@ -98,9 +145,14 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
     connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
     connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
+    vercelRelayUrl: credentials?.providerSpecificData?.vercelRelayUrl || "",
   };
 
-  if (proxyOptions.connectionProxyEnabled && proxyOptions.connectionProxyUrl) {
+  if (proxyOptions.vercelRelayUrl) {
+    const connectionName = credentials?.connectionName || credentials?.connectionId || "unknown";
+    const poolId = credentials?.providerSpecificData?.connectionProxyPoolId || "none";
+    log?.info?.("PROXY", `${provider.toUpperCase()} | ${model} | conn=${connectionName} | pool=${poolId} | vercel-relay=${proxyOptions.vercelRelayUrl}`);
+  } else if (proxyOptions.connectionProxyEnabled && proxyOptions.connectionProxyUrl) {
     let maskedProxyUrl = proxyOptions.connectionProxyUrl;
     try {
       const parsed = new URL(proxyOptions.connectionProxyUrl);
@@ -133,7 +185,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
   } catch (error) {
     trackPendingRequest(model, provider, connectionId, false, true);
-    appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => {});
+    appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
       latency: { ttft: 0, total: Date.now() - requestStartTime },
@@ -142,7 +194,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       providerRequest: translatedBody || null,
       response: { error: error.message || String(error), status: error.name === "AbortError" ? 499 : 502, thinking: null },
       status: "error"
-    })).catch(() => {});
+    })).catch(() => { });
 
     if (error.name === "AbortError") {
       streamController.handleError(error);
@@ -153,8 +205,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, errMsg);
   }
 
-  // Handle 401/403 - try token refresh
-  if (providerResponse.status === HTTP_STATUS.UNAUTHORIZED || providerResponse.status === HTTP_STATUS.FORBIDDEN) {
+  // Handle 401/403 - try token refresh (skip for noAuth providers)
+  if (!executor.noAuth && (providerResponse.status === HTTP_STATUS.UNAUTHORIZED || providerResponse.status === HTTP_STATUS.FORBIDDEN)) {
     try {
       const newCredentials = await refreshWithRetry(() => executor.refreshCredentials(credentials, log), 3, log);
       if (newCredentials?.accessToken || newCredentials?.copilotToken) {
@@ -178,8 +230,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Provider returned error
   if (!providerResponse.ok) {
     trackPendingRequest(model, provider, connectionId, false, true);
-    const { statusCode, message, retryAfterMs } = await parseUpstreamError(providerResponse, provider);
-    appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => {});
+    const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
+    appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
       latency: { ttft: 0, total: Date.now() - requestStartTime },
@@ -188,19 +240,16 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       providerRequest: finalBody || translatedBody || null,
       response: { error: message, status: statusCode, thinking: null },
       status: "error"
-    })).catch(() => {});
+    })).catch(() => { });
 
     const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
     console.log(`${COLORS.red}[ERROR] ${errMsg}${COLORS.reset}`);
-    if (retryAfterMs && provider === "antigravity") {
-      log?.debug?.("RETRY", `Antigravity quota reset in ${Math.ceil(retryAfterMs / 1000)}s`);
-    }
     reqLogger.logError(new Error(message), finalBody || translatedBody);
-    return createErrorResult(statusCode, errMsg, retryAfterMs);
+    return createErrorResult(statusCode, errMsg, resetsAtMs);
   }
 
   const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess };
-  const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => {});
+  const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
 
   // Provider forced streaming but client wants JSON
@@ -211,7 +260,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // True non-streaming response
   if (!stream) {
-    const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, reqLogger, trackDone, appendLog });
+    const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, reqLogger, toolNameMap, trackDone, appendLog });
     streamController.handleComplete();
     return result;
   }

@@ -15,10 +15,13 @@
 
 # next.js
 /.next/
+/.next-cli-build/
 /out/
+cli/.build-home/
 product
 # production
 /build
+.idea/
 
 # misc
 .DS_Store
@@ -49,7 +52,6 @@ source/*
 docs/*
 !docs/ARCHITECTURE.md
 test/*
-bin/*
 open-sse/test/*
 RM.vn.md
 RM.md
@@ -67,3 +69,6 @@ README1.md
 deploy*.sh
 ecosystem.config.*
 
+scripts/agSniffer/*
+gitbooks/*
+gitbook/README.md

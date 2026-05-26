@@ -12,7 +12,7 @@ initDbHooks(getSettings, updateSettings);
 const EXTENDED_PATH = `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:${process.env.PATH || ""}`;
 
 function hasBrew() {
-  try { execSync("which brew", { stdio: "ignore", env: { ...process.env, PATH: EXTENDED_PATH } }); return true; } catch { return false; }
+  try { execSync("which brew", { stdio: "ignore", windowsHide: true, env: { ...process.env, PATH: EXTENDED_PATH } }); return true; } catch { return false; }
 }
 
 export async function POST(request) {
@@ -36,8 +36,14 @@ export async function POST(request) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
+      let closed = false;
       const send = (event, data) => {
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        } catch {
+          closed = true;
+        }
       };
 
       try {
@@ -52,7 +58,7 @@ export async function POST(request) {
           : error.message;
         send("error", { error: msg });
       } finally {
-        controller.close();
+        if (!closed) { try { controller.close(); } catch {} }
       }
     },
   });

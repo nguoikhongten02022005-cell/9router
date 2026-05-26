@@ -1,12 +1,18 @@
 import { platform, arch } from "os";
 
 // === Gemini CLI ===
-export const GEMINI_CLI_VERSION = "0.31.0";
+export const GEMINI_CLI_VERSION = "0.34.0";
 export const GEMINI_CLI_API_CLIENT = "google-genai-sdk/1.41.0 gl-node/v22.19.0";
 
+// Map Node arch to Gemini CLI arch string (x64/x86/arm64/...)
+function geminiCLIArch() {
+  const a = arch();
+  if (a === "ia32") return "x86";
+  return a;
+}
+
 export function geminiCLIUserAgent(model = "unknown") {
-  const os = platform() === "win32" ? "windows" : platform();
-  return `GeminiCLI/${GEMINI_CLI_VERSION}/${model || "unknown"} (${os}; ${arch()})`;
+  return `GeminiCLI/${GEMINI_CLI_VERSION}/${model || "unknown"} (${platform()}; ${geminiCLIArch()}; terminal)`;
 }
 
 // === GitHub Copilot ===
@@ -146,6 +152,16 @@ export const LOAD_CODE_ASSIST_METADATA = {
 export const CLAUDE_SYSTEM_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude.";
 export const ANTIGRAVITY_DEFAULT_SYSTEM = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**";
 
+// Proactive token refresh lead times per provider (ms)
+export const REFRESH_LEAD_MS = {
+  codex:       5 * 24 * 60 * 60 * 1000, // 5 days
+  claude:       4 * 60 * 60 * 1000,     // 4 hours
+  iflow:       24 * 60 * 60 * 1000,     // 24 hours
+  qwen:        20 * 60 * 1000,          // 20 minutes
+  "kimi-coding": 5 * 60 * 1000,         // 5 minutes
+  antigravity:  5 * 60 * 1000,          // 5 minutes
+};
+
 // OAuth endpoints
 export const OAUTH_ENDPOINTS = {
   google: {
@@ -161,8 +177,8 @@ export const OAUTH_ENDPOINTS = {
     auth: "https://api.anthropic.com/v1/oauth/authorize"
   },
   qwen: {
-    token: "https://chat.qwen.ai/api/v1/oauth2/token",
-    auth: "https://chat.qwen.ai/api/v1/oauth2/device/code"
+    token: "https://qwen.ai/api/v1/oauth2/token",
+    auth: "https://qwen.ai/api/v1/oauth2/device/code"
   },
   iflow: {
     token: "https://iflow.cn/oauth/token",
